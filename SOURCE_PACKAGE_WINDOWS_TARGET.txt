@@ -1,0 +1,5 @@
+Windows 10 x64
+Windows 11 x64
+Python 3.11 x64
+PyInstaller
+Inno Setup 6

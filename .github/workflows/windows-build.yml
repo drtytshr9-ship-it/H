@@ -1,0 +1,164 @@
+name: Build Herfy Tracking System 2.18.1
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: herfy-windows-2-18-1-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows:
+    name: Build and acceptance-test Windows 2.18.1
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11 x64
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: x64
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $candidate = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path -LiteralPath $candidate)) { throw 'Inno Setup compiler missing' }
+          Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $candidate -Parent)
+
+      - name: Fetch pinned approved source and preparation script
+        shell: pwsh
+        run: |
+          $commit = 'b9715d9caebe1b24cd6e7824a9b208878976b0c5'
+          $base = "https://raw.githubusercontent.com/ejram-ksa/herfy-client-build/$commit"
+          New-Item -ItemType Directory -Path source,.github/scripts,prepared -Force | Out-Null
+          Invoke-WebRequest -Uri "$base/source/HerfyTrackingSystem_2.18.0_Client_Source.zip" -OutFile 'source/base.zip'
+          Invoke-WebRequest -Uri "$base/.github/scripts/prepare_release_2_18_1.py" -OutFile '.github/scripts/prepare_release_2_18_1.py'
+          $expected = 'a797c52975530bb3e34b00ef54f000364402f6a5eddf24b3e086af4bfe0d9375'
+          $actual = (Get-FileHash -LiteralPath 'source/base.zip' -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "Pinned source checksum mismatch expected=$expected actual=$actual" }
+          Write-Host "HERFY_PINNED_SOURCE_OK sha256=$actual"
+
+      - name: Prepare clean 2.18.1 source
+        shell: pwsh
+        run: |
+          Remove-Item client -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath 'source/base.zip' -DestinationPath client -Force
+          python .github/scripts/prepare_release_2_18_1.py client prepared/HerfyTrackingSystem_2.18.1_Client_Source.zip
+          $version = Get-Content -LiteralPath client/version.json -Raw -Encoding UTF8 | ConvertFrom-Json
+          if ($version.app_version -ne '2.18.1') { throw "Prepared source version mismatch: $($version.app_version)" }
+          Write-Host 'HERFY_PREPARED_SOURCE_OK'
+
+      - name: Install Python dependencies
+        shell: pwsh
+        working-directory: client
+        run: |
+          python -m pip install --upgrade pip
+          if (Test-Path requirements.txt) { python -m pip install -r requirements.txt }
+          if (Test-Path requirements-build.txt) { python -m pip install -r requirements-build.txt }
+          if (Test-Path requirements-test.txt) { python -m pip install -r requirements-test.txt }
+          python -m pip install pytest
+
+      - name: Verify source
+        shell: pwsh
+        working-directory: client
+        run: |
+          python -m compileall -q .
+          if (Test-Path tests) { python -m pytest -q }
+          if (Test-Path tools/verify/verify_project.py) { python tools/verify/verify_project.py }
+          Write-Host 'HERFY_SOURCE_VERIFICATION_OK'
+
+      - name: Build application, update agent, and installer
+        id: build
+        shell: pwsh
+        working-directory: client
+        run: |
+          if (Test-Path BUILD.ps1) {
+            & .\BUILD.ps1 -Clean *>&1 | Tee-Object -FilePath build.log
+          } elseif (Test-Path tools/build/build.cmd) {
+            & cmd.exe /d /c tools\build\build.cmd *>&1 | Tee-Object -FilePath build.log
+          } else {
+            throw 'No supported Windows build entry point found'
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Locate installer and runtime
+        id: locate
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem client -Recurse -File -Filter '*Setup*.exe' | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+          if (-not $setup) { throw 'Installer was not produced' }
+          $app = Get-ChildItem client,$env:LOCALAPPDATA -Recurse -File -Filter 'HerfyTrackingSystem.exe' -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+          $agent = Get-ChildItem client,$env:LOCALAPPDATA -Recurse -File -Filter 'HerfyTrackingSystemUpdateAgent.exe' -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+          if (-not $app) { throw 'Application EXE was not produced' }
+          if (-not $agent) { throw 'Update Agent EXE was not produced' }
+          "SETUP_PATH=$($setup.FullName)" | Add-Content $env:GITHUB_ENV
+          "APP_PATH=$($app.FullName)" | Add-Content $env:GITHUB_ENV
+          "AGENT_PATH=$($agent.FullName)" | Add-Content $env:GITHUB_ENV
+          Write-Host "HERFY_BUILD_OUTPUTS_OK setup=$($setup.FullName) app=$($app.FullName) agent=$($agent.FullName)"
+
+      - name: Install, self-check, and uninstall
+        shell: pwsh
+        run: |
+          $installRoot = Join-Path $env:RUNNER_TEMP 'HerfyTrackingSystem-2.18.1-installed'
+          $selfCheck = Join-Path $env:RUNNER_TEMP 'self-check.json'
+          $notificationCheck = Join-Path $env:RUNNER_TEMP 'notification-check.json'
+          Remove-Item $installRoot -Recurse -Force -ErrorAction SilentlyContinue
+          $p = Start-Process -FilePath $env:SETUP_PATH -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/DIR=$installRoot",'/TASKS=') -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Installer failed: $($p.ExitCode)" }
+          $installedApp = Join-Path $installRoot 'HerfyTrackingSystem.exe'
+          $installedAgent = Join-Path $installRoot 'HerfyTrackingSystemUpdateAgent.exe'
+          $uninstaller = Join-Path $installRoot 'unins000.exe'
+          foreach ($required in @($installedApp,$installedAgent,$uninstaller)) {
+            if (-not (Test-Path -LiteralPath $required)) { throw "Installed file missing: $required" }
+          }
+          & $installedApp --self-check-file $selfCheck
+          if ($LASTEXITCODE -ne 0) { throw "Self-check failed: $LASTEXITCODE" }
+          & $installedApp --notification-self-check-file $notificationCheck
+          if ($LASTEXITCODE -ne 0) { throw "Notification self-check failed: $LASTEXITCODE" }
+          $u = Start-Process -FilePath $uninstaller -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART') -Wait -PassThru
+          if ($u.ExitCode -ne 0) { throw "Uninstall failed: $($u.ExitCode)" }
+          Write-Host 'HERFY_INSTALL_SELF_CHECK_UNINSTALL_OK'
+
+      - name: Collect verified release
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release -Force | Out-Null
+          Copy-Item -LiteralPath $env:SETUP_PATH -Destination 'release/HerfyTrackingSystem_2.18.1_Setup.exe' -Force
+          Copy-Item -LiteralPath $env:APP_PATH -Destination 'release/HerfyTrackingSystem_2.18.1.exe' -Force
+          Copy-Item -LiteralPath $env:AGENT_PATH -Destination 'release/HerfyTrackingSystemUpdateAgent_2.18.1.exe' -Force
+          Copy-Item -LiteralPath 'prepared/HerfyTrackingSystem_2.18.1_Client_Source.zip' -Destination release -Force
+          Get-ChildItem release -File | Get-FileHash -Algorithm SHA256 | ForEach-Object {
+            "$($_.Hash.ToLowerInvariant())  $($_.Path | Split-Path -Leaf)"
+          } | Set-Content -LiteralPath 'release/SHA256SUMS.txt' -Encoding ascii
+          Get-ChildItem release -File | Format-Table Name,Length
+          Write-Host 'HERFY_WINDOWS_RELEASE_OK'
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: HerfyTrackingSystem-2.18.1-Diagnostics
+          path: |
+            client/build.log
+            client/publish/**
+            prepared/**
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload verified Windows release
+        uses: actions/upload-artifact@v4
+        with:
+          name: HerfyTrackingSystem-2.18.1-Windows
+          path: release/*
+          if-no-files-found: error
+          retention-days: 30

@@ -1,0 +1,7 @@
+PyQt5 desktop runtime
+Main application EXE
+Update Agent EXE
+Inno Setup installer
+QSystemTrayIcon
+HKCU autostart
+Atomic update and rollback

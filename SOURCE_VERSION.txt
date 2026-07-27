@@ -1,0 +1,3 @@
+HerfyTrackingSystem 2.18.1
+Clean development/build source
+SHA-256 3f88c19797ec264d5ea9276bf4734b77051aa971d979b46cad4412d9b9e95a8b
